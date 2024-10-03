@@ -121,6 +121,8 @@ def get_final_norm(model: Model) -> Norm:
         final_layer_norm = base_model.norm
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         final_layer_norm = base_model.norm
+    elif isinstance(base_model,  models.recurrent_gemma.modeling_recurrent_gemma.RecurrentGemmaModel):
+        final_layer_norm = base_model.final_norm
     else:
         raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
