@@ -1,4 +1,5 @@
 """Provides lenses for decoding hidden states into logits."""
+
 import abc
 import inspect
 import json
@@ -6,7 +7,7 @@ import logging
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Generator, Optional, Union
+from typing import Dict, Generator, Optional, Union, List
 
 import torch as th
 from transformers import PreTrainedModel
@@ -165,7 +166,10 @@ class TunedLens(Lens):
 
         # Don't include the final layer since it does not need a translator
         self.layer_translators = th.nn.ModuleList(
-            [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
+            [
+                deepcopy(translator)
+                for _ in range(self.config.num_hidden_layers)
+            ]
         )
 
     def __getitem__(self, item: int) -> th.nn.Module:
@@ -252,7 +256,9 @@ class TunedLens(Lens):
             A TunedLens instance.
         """
         # Validate kwargs
-        load_artifact_varnames = load_artifacts.load_lens_artifacts.__code__.co_varnames
+        load_artifact_varnames = (
+            load_artifacts.load_lens_artifacts.__code__.co_varnames
+        )
 
         config_path, ckpt_path = load_artifacts.load_lens_artifacts(
             resource_id=lens_resource_id,
@@ -263,7 +269,10 @@ class TunedLens(Lens):
             config = TunedLensConfig.from_dict(json.load(f))
 
         # validate the unembed is the same as the one used to train the lens
-        if config.unembed_hash and unembed.unembedding_hash() != config.unembed_hash:
+        if (
+            config.unembed_hash
+            and unembed.unembedding_hash() != config.unembed_hash
+        ):
             logger.warning(
                 "The unembedding matrix hash does not match the lens' hash."
                 "This lens may have been trained with a different unembedding."
@@ -273,7 +282,11 @@ class TunedLens(Lens):
         lens = cls(unembed, config)
 
         th_load_kwargs = {
-            **{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}
+            **{
+                k: v
+                for k, v in kwargs.items()
+                if k not in load_artifact_varnames
+            }
         }
         # Load parameters
         state = th.load(ckpt_path, **th_load_kwargs)
@@ -381,3 +394,35 @@ class TunedLens(Lens):
                 break
 
         return tokens
+
+
+class SkipLens(TunedLens):
+
+    @classmethod
+    def from_model(
+        cls,
+        model: PreTrainedModel,
+        skip: List,
+        model_revision: Optional[str] = None,
+        bias: bool = True,
+    ) -> "TunedLens":
+        """Create a lens from a pretrained model.
+
+        Args:
+            model: The model to create the lens from.
+            model_revision: The git revision of the model to used.
+            bias: Whether to use a bias in the linear translators.
+
+        Returns:
+            A TunedLens instance.
+        """
+        unembed = Unembed(model)
+        config = TunedLensConfig(
+            base_model_name_or_path=model.config.name_or_path,
+            base_model_revision=model_revision,
+            d_model=model.config.hidden_size,
+            num_hidden_layers=1,
+            bias=bias,
+        )
+
+        return cls(unembed, config)

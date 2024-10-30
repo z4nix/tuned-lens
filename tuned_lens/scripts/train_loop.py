@@ -1,12 +1,15 @@
 """Training loop for training a TunedLens model against a transformer on a dataset."""
+
 import dataclasses
 import enum
 import logging
 import re
+from json import dump
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, List
+from copy import deepcopy
 
 import torch as th
 from simple_parsing import field
@@ -19,7 +22,8 @@ from tqdm.auto import trange
 from transformers import PreTrainedModel
 
 import tuned_lens.scripts.ingredients as ing
-from tuned_lens import TunedLens
+from tuned_lens import TunedLens, SkipLens
+from tuned_lens.model_surgery import get_transformer_layers
 from tuned_lens.utils import maybe_all_reduce, shift_labels, shift_preds
 
 logger = logging.getLogger(__name__)
@@ -124,6 +128,9 @@ class Train:
     loss: LossChoice = LossChoice.KL
     """Loss function to use."""
 
+    skip: Optional[List[int]] = None
+    """List of indexes to be replaced by affine translators"""
+
     def __post_init__(self):
         """Set defaults for some fields."""
         if self.checkpoint_dir is None:
@@ -136,7 +143,9 @@ class Train:
             lens = TunedLens.from_model(model)
         else:
             logger.info("Loading pretrained lens...")
-            lens = TunedLens.from_model_and_pretrained(model, self.lens_name_or_path)
+            lens = TunedLens.from_model_and_pretrained(
+                model, self.lens_name_or_path
+            )
 
         dtypes = {p.dtype for p in lens.parameters()}
         assert (
@@ -144,7 +153,9 @@ class Train:
         ), f"Expected all parameters to have the same dtype, got {dtypes}"
 
         lens_dtype = next(iter(dtypes))
-        lens_size = sum(p.numel() * p.element_size() for p in lens.parameters())
+        lens_size = sum(
+            p.numel() * p.element_size() for p in lens.parameters()
+        )
 
         # Include the optimizer state in the memory usage
         num_bytes = lens_size * (self.opt.per_parameter_optim_state_size() + 1)
@@ -153,7 +164,9 @@ class Train:
         )
 
         if self.bias_only:
-            logger.info("Freezing the matrix weights to train only the bias terms.")
+            logger.info(
+                "Freezing the matrix weights to train only the bias terms."
+            )
             for probe in lens:
                 probe.weight.requires_grad_(False)
 
@@ -167,7 +180,9 @@ class Train:
 
         return runid.generate_id()
 
-    def _init_logging(self, model_name: str, lens: TunedLens, wandb_id: Optional[str]):
+    def _init_logging(
+        self, model_name: str, lens: TunedLens, wandb_id: Optional[str]
+    ):
         """Initialize logging to weights and biases."""
         if not self.dist.primary or not self.wandb:
             return
@@ -200,7 +215,10 @@ class Train:
 
         log_dict = {}
         log_dict.update(
-            {f"loss/{k}": th.tensor(v).mean() * nats_to_bpb for k, v in losses.items()}
+            {
+                f"loss/{k}": th.tensor(v).mean() * nats_to_bpb
+                for k, v in losses.items()
+            }
         )
 
         # Log statistics about optimizer & probes
@@ -216,7 +234,9 @@ class Train:
                     [
                         # Undo PyTorch's scaling of the gradient by
                         # 1 / (1 - β)
-                        (1 - self.opt.momentum) * s["momentum_buffer"].flatten() / corr
+                        (1 - self.opt.momentum)
+                        * s["momentum_buffer"].flatten()
+                        / corr
                         for s in states
                     ]
                 ).norm()
@@ -243,7 +263,9 @@ class Train:
         assert self.checkpoint_dir is not None
 
         if not self.checkpoint_dir.exists():
-            logger.warning("No checkpoint directory found. Snapshotting is disabled.")
+            logger.warning(
+                "No checkpoint directory found. Snapshotting is disabled."
+            )
             return None
 
         # Find the folder containing the most recent snapshot
@@ -289,7 +311,9 @@ class Train:
             # If the number of samples per step isn't divisible by the global batch
             # size, use ceil division and let the user know about it.
             grad_acc_steps += 1
-            adjusted_count = grad_acc_steps * global_batch_size * tokens_per_sample
+            adjusted_count = (
+                grad_acc_steps * global_batch_size * tokens_per_sample
+            )
             logger.warning(
                 f"Note: Increasing grad acc steps from {grad_acc_steps - 1} to "
                 f"{grad_acc_steps} to maintain load balance across "
@@ -301,8 +325,26 @@ class Train:
             )
         else:
             logger.info(f"Gradient accumulation steps: {grad_acc_steps}")
-            logger.info(f"Using {self.tokens_per_step:_} tokens per training step.")
+            logger.info(
+                f"Using {self.tokens_per_step:_} tokens per training step."
+            )
         return grad_acc_steps
+
+    def skipped_model(self, model: th.nn.module, tokenizer) -> th.nn.module:
+        """
+        returns a model in which specified layers are replaced
+        by affine translators
+        """
+        # create new instance of skiptrain class without __init__
+        skip_train = SkipTrain.__new__(SkipTrain)
+
+        # copy attributes of self
+        skip_train.__dict__.update(deepcopy(self).__dict__)
+        skip_train.output = self.output + "_replacement_layers"
+
+        # execute with model, tokenizer
+
+        return model
 
     def setup(self) -> tuple[State, Union[PreTrainedModel, FSDP], int]:
         """Initialize the training process."""
@@ -326,13 +368,17 @@ class Train:
         if not self.dist.primary:
             # Let the non-primary processes load from the cache
             logger.debug("Non-primary rank loading from cache...")
-            model, tokenizer = self.model.load(load_device, must_use_cache=True)
+            model, tokenizer = self.model.load(
+                load_device, must_use_cache=True
+            )
             data, nats_to_bpb = self.data.load(tokenizer)
             lens = self.get_lens(model)
 
         assert model and tokenizer and data and lens and nats_to_bpb
 
-        logger.debug(f"Creating data loader and setting seed to {self.seed} ...")
+        logger.debug(
+            f"Creating data loader and setting seed to {self.seed} ..."
+        )
         dl = self.dist.dataloader(data)
         dl.seed(self.seed)
         logger.debug("Creating optimizer and scheduler ...")
@@ -354,11 +400,15 @@ class Train:
 
         self.load_recent_snapshot(state)
 
+        if self.skip:
+            model = self.skipped_model(model, tokenizer)
         # Shard the model using fully shared data parallel
         model = self.dist.shard_model(model)
 
         self._init_logging(
-            model_name=self.model.name, lens=state.lens, wandb_id=state.wandb_id
+            model_name=self.model.name,
+            lens=state.lens,
+            wandb_id=state.wandb_id,
         )
 
         tokens_per_sample = len(data[0]["input_ids"])
@@ -391,6 +441,7 @@ class Train:
             initial=init_batches,
             total=total_batches,
         )
+
         # TODO this currently silently fails if the dataloader is exhausted
         for batch_idx, batch in zip(t, state.dataloader):
             assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
@@ -399,10 +450,12 @@ class Train:
                 batch = self.dist.send_to_device(batch)
                 output = model(**batch, output_hidden_states=True)
 
+            # clip final_logits to have index as the last layer
             final_logits = output.logits
             hidden_states = output.hidden_states[:-1]
 
             shift = self.token_shift
+
             if self.loss == LossChoice.CE:
                 labels = batch["input_ids"]
 
@@ -434,7 +487,8 @@ class Train:
                         )
                     elif self.loss == LossChoice.KL:
                         loss = th.sum(
-                            labels.exp() * (labels - logits.log_softmax(-1)), dim=-1
+                            labels.exp() * (labels - logits.log_softmax(-1)),
+                            dim=-1,
                         ).mean()
                     else:
                         raise NotImplementedError
@@ -472,3 +526,217 @@ class Train:
             # Unwrap the lens from DDP if needed
             lens = getattr(state.lens, "module", state.lens)
             lens.save(self.output)
+
+
+@dataclass
+class SkipTrain(Train):
+
+    def get_lens(self, model: PreTrainedModel) -> TunedLens:
+        """Load or create a TunedLens model."""
+        if self.lens_name_or_path is None:
+            logger.info("Randomly initializing lens...")
+            lens = SkipLens.from_model(model, self.skip, bias=True)
+        else:
+            raise NotImplementedError(
+                "If skip is specified, no lens may be specified."
+            )
+
+        dtypes = {p.dtype for p in lens.parameters()}
+        assert (
+            len(dtypes) == 1
+        ), f"Expected all parameters to have the same dtype, got {dtypes}"
+
+        lens_dtype = next(iter(dtypes))
+        lens_size = sum(
+            p.numel() * p.element_size() for p in lens.parameters()
+        )
+
+        # Include the optimizer state in the memory usage
+        num_bytes = lens_size * (self.opt.per_parameter_optim_state_size() + 1)
+        logger.info(
+            f"Tuned lens memory usage: {num_bytes / 2 ** 20:.2f} MB in {lens_dtype}"
+        )
+
+        return lens
+
+    def setup(self, model, tokenizer) -> tuple[State, PreTrainedModel, int]:
+        """Initialize the training process."""
+        self.dist.init()
+        data = lens = nats_to_bpb = None
+
+        # FSDP is not available for this
+
+        logger.debug("Primary rank populating cache...")
+        data, nats_to_bpb = self.data.load(tokenizer)
+        lens = self.get_lens(model)
+
+        self.dist.barrier()  # Wait for primary to finish filling the cache
+
+        assert model and tokenizer and data and lens and nats_to_bpb
+
+        logger.debug(
+            f"Creating data loader and setting seed to {self.seed} ..."
+        )
+        dl = self.dist.dataloader(data)
+        dl.seed(self.seed)
+        logger.debug("Creating optimizer and scheduler ...")
+        params = [p for p in lens.parameters() if p.requires_grad]
+        opt = self.opt.create_optim(params)
+        scheduler = self.opt.create_scheduler(opt, self.num_steps)
+
+        ddp_lens = self.dist.distribute_lens(lens)
+
+        state = State(
+            step=0,
+            wandb_id=self._get_wandb_id(),
+            lens=ddp_lens,  # type: ignore
+            opt=opt,
+            scheduler=scheduler,
+            dataloader=dl,
+            nats_to_bpb=nats_to_bpb,
+        )
+
+        self.load_recent_snapshot(state)
+
+        self._init_logging(
+            model_name=self.model.name,
+            lens=state.lens,
+            wandb_id=state.wandb_id,
+        )
+
+        tokens_per_sample = len(data[0]["input_ids"])
+        grad_acc_steps = self.calculate_gradient_accumulation_steps(
+            tokens_per_sample, len(data)
+        )
+
+        self.dist.barrier()  # Wait for all processes to finish setup
+        logger.info("All processes have completed setup.")
+        return state, grad_acc_steps
+
+    def execute(self, model) -> th.nn.PreTrainedModel:
+        replacement_layers = th.nn.ModuleList()
+        # train layers
+        for layer in self.skip:
+            translator = self.train_translator(model, layer)
+            get_transformer_layers(model)[layer] = translator
+            replacement_layers.append(translator)
+
+        # save layers
+        path = Path(self.output)
+        path.mkdir(exist_ok=True, parents=True)
+        state_dict = replacement_layers.state_dict()
+
+        th.save(state_dict, path / "params.pt")
+        config = {"skipped_layers": self.skip}
+        with open(path / "config.json", "w") as f:
+            dump(config.to_dict(), f)
+
+        return model
+
+    def train_translator(self, model, layer_index) -> th.nn.Module.Linear:
+        """Trains an affine translator to replace a model layer."""
+        # Load model, tokenizer, data, and lens
+        state, grad_acc_steps = self.setup()
+
+        losses = defaultdict(list)
+        init_batches = state.step * grad_acc_steps
+        total_batches = self.num_steps * grad_acc_steps
+
+        # Wait for all processes to finish setup
+        self.dist.barrier()
+        logger.info("All processes have completed setup. Starting training.")
+
+        # Main training loop
+        t = trange(
+            init_batches,
+            total_batches,
+            desc="Training",
+            initial=init_batches,
+            total=total_batches,
+        )
+
+        # TODO this currently silently fails if the dataloader is exhausted
+        for batch_idx, batch in zip(t, state.dataloader):
+            assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
+
+            with th.no_grad():
+                batch = self.dist.send_to_device(batch)
+                output = model(**batch, output_hidden_states=True)
+
+            # clip logits and hidden states to be of length 2 and 1
+            replace_logits = output.logits[layer_index - 1 : layer_index + 1]
+            hidden_state = output.hidden_states[layer_index - 1]
+
+            shift = self.token_shift
+
+            # TODO: check with davide and steve
+            if self.loss == LossChoice.CE:
+                labels = batch["input_ids"]
+
+                # Predict the *next* token by default w/ cross entropy
+                if shift is None:
+                    shift = 1
+            elif self.loss == LossChoice.KL:
+                labels = replace_logits.float().log_softmax(dim=-1)
+
+                # Match the *current* token distribution by default
+                if shift is None:
+                    shift = 0
+            else:
+                raise NotImplementedError(f"Unknown loss {self.loss}")
+
+            labels = shift_labels(labels, shift)
+
+            # We use bfloat16 because it has a larger dynamic range than float16
+            # and it seems to remove the need for doing grad scaling, which is very
+            # annoying to set up in the context of multiple backward passes.
+            with th.autocast(self.dist.device.type, dtype=th.bfloat16):
+                logits = shift_preds(state.lens(hidden_state, idx=0), shift)
+
+                if self.loss == LossChoice.CE:
+                    loss = th.nn.functional.cross_entropy(
+                        logits.flatten(0, -2), labels.flatten()
+                    )
+                elif self.loss == LossChoice.KL:
+                    loss = th.sum(
+                        labels.exp() * (labels - logits.log_softmax(-1)),
+                        dim=-1,
+                    ).mean()
+                else:
+                    raise NotImplementedError
+
+                logging_loss = loss.detach()
+                logging_loss = maybe_all_reduce(logging_loss).item()
+                if self.dist.primary:
+                    losses[f"translator_{layer_index}"].append(logging_loss)
+
+                scaled_loss = loss / grad_acc_steps
+
+            scaled_loss.backward()
+
+            step, rem = divmod(batch_idx, grad_acc_steps)
+            if rem == grad_acc_steps - 1:
+                th.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
+                state.opt.step()
+                state.opt.zero_grad(set_to_none=False)
+                state.scheduler.step()
+
+                # Unwrap the lens from DDP if needed
+                lens = getattr(state.lens, "module", state.lens)
+                self._log(state.opt, step, losses, lens, state.nats_to_bpb)
+                losses.clear()
+                state.step = step + 1
+                if (
+                    self.checkpoint_freq
+                    and step % self.checkpoint_freq == self.checkpoint_freq - 1
+                ):
+                    self.snapshot(state)
+
+        if self.dist.primary:
+            logger.info(f"Saving lens to {self.output}")
+
+            # Unwrap the lens from DDP if needed
+            lens = getattr(state.lens, "module", state.lens)
+            translator_layer = deepcopy(lens[0])
+            del lens
+            return translator_layer
